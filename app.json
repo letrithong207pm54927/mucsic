@@ -9,9 +9,15 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.yourname.musicfinder",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Ứng dụng cần sử dụng Microphone để nhận diện lời bài hát của bạn.",
+        "NSSpeechRecognitionUsageDescription": "Ứng dụng cần quyền nhận diện giọng nói để chuyển lời thoại thành văn bản."
+      }
     },
     "android": {
+      "package": "com.yourname.musicfinder",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -19,7 +25,10 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "RECORD_AUDIO"
+      ]
     },
     "web": {
       "output": "static",
@@ -37,6 +46,13 @@
           "dark": {
             "backgroundColor": "#000000"
           }
+        }
+      ],
+      [
+        "@react-native-voice/voice",
+        {
+          "microphonePermission": "Ứng dụng cần sử dụng Microphone để nhận diện lời bài hát của bạn.",
+          "speechRecognitionPermission": "Ứng dụng cần quyền nhận diện giọng nói để chuyển lời thoại thành văn bản."
         }
       ]
     ],
