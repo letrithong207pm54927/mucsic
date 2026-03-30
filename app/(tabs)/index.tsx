@@ -1,8 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, ScrollView, Alert, BackHandler, Platform, Image, ActivityIndicator, Animated, Easing } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import React, { useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, Animated, BackHandler, Easing, Linking, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
-// FIX LỖI TYPESCRIPT: Định nghĩa kiểu dữ liệu cho Web Speech API
+// API Token chính thức từ audd.io (Sử dụng "test" sẽ bị giới hạn kết quả theo FR-05)
+const AUDD_API_TOKEN = "test"; 
+
 const SpeechRecognition = typeof window !== 'undefined' 
   ? ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition) 
   : null;
@@ -14,154 +16,205 @@ if (SpeechRecognition) {
   recognition.interimResults = false;
 }
 
-// Tên APP mới
-const APP_NAME = "MELODY ID"; // Tên ứng dụng VIP Pro
+const APP_NAME = "MELODY ID";
 
 export default function HomeScreen() {
-  const [isRecording, setIsRecording] = useState(false); // FR-02
-  const [transcript, setTranscript] = useState(''); // FR-03
-  const [searchResult, setSearchResult] = useState<any>(null); // FR-06
-  const [history, setHistory] = useState<any[]>([]); // FR-09
-  const [language, setLanguage] = useState('vi-VN'); // FR-10
-  const [isLoading, setIsLoading] = useState(false); // Trạng thái loading
-  const [isPlayingPreview, setIsPlayingPreview] = useState(false); // Trạng thái phát nhạc mẫu
+  const [isRecording, setIsRecording] = useState(false);
+  const [isScanningMusic, setIsScanningMusic] = useState(false);
+  const [transcript, setTranscript] = useState('');
+  const [searchResult, setSearchResult] = useState<any>(null);
+  const [history, setHistory] = useState<any[]>([]);
+  const [language, setLanguage] = useState('vi-VN');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isPlayingPreview, setIsPlayingPreview] = useState(false);
 
+  // Karaoke & Animation
+  const [lyrics, setLyrics] = useState<{time: number, text: string}[]>([]);
+  const [currentLyricIndex, setCurrentLyricIndex] = useState(-1);
+  const lyricOpacity = useRef(new Animated.Value(0)).current;
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const spinValue = useRef(new Animated.Value(0)).current; // Dành cho hiệu ứng xoay đĩa nhạc
+  const spinValue = useRef(new Animated.Value(0)).current;
+
+  // MediaRecorder dành cho chức năng Quét nhạc
+  const mediaRecorderRef = useRef<any>(null);
+  const audioChunksRef = useRef<any[]>([]);
+
+  // --- FIX FR-12: TÁCH RIÊNG LOGIC THOÁT ỨNG DỤNG ---
+  useEffect(() => {
+    const handleBackAction = () => {
+      if (Platform.OS === 'android') {
+        Alert.alert("Thoát ứng dụng", "Bạn có chắc chắn muốn thoát không?", [
+          { text: "Hủy", style: "cancel" },
+          { text: "Thoát", onPress: () => BackHandler.exitApp() }
+        ]);
+        return true; // Ngăn chặn hành vi back mặc định
+      }
+      return false;
+    };
+
+    const backHandler = BackHandler.addEventListener("hardwareBackPress", handleBackAction);
+    return () => backHandler.remove();
+  }, []); // Mảng phụ thuộc rỗng để luôn lắng nghe sự kiện thoát
 
   useEffect(() => {
-    loadHistory(); 
+    loadHistory();
     if (recognition) {
+      recognition.lang = language;
       recognition.onresult = (event: any) => {
         const text = event.results[0][0].transcript;
         setTranscript(text);
-        setIsLoading(true); // Bắt đầu loading khi có kết quả transcript
-        processAndSearch(text); // FR-04 & FR-05
+        setIsLoading(true);
+        processAndSearch(text);
         setIsRecording(false);
       };
       recognition.onerror = () => {
         setIsRecording(false);
         setIsLoading(false);
-        Alert.alert("Thông báo", "Không nhận diện được lời thoại. Thử lại nhé!"); // FR-07
+        Alert.alert("Thông báo", "Giọng nói không rõ hoặc không nhận diện được lời thoại. Vui lòng thử lại.");
       };
-      recognition.onend = () => setIsRecording(false);
-    }
-
-    if (Platform.OS === 'android') {
-      const backAction = () => {
-        Alert.alert("Xác nhận", "Bạn muốn thoát ứng dụng?", [
-          { text: "Hủy", style: "cancel" },
-          { text: "Thoát", onPress: () => BackHandler.exitApp() }
-        ]);
-        return true;
-      };
-      const backHandler = BackHandler.addEventListener("hardwareBackPress", backAction);
-      return () => backHandler.remove();
     }
   }, [language]);
 
-  // Hiệu ứng xoay đĩa nhạc
+  // Hiệu ứng Fade cho chữ Karaoke (Tắt useNativeDriver trên Web)
   useEffect(() => {
-    if (isPlayingPreview) {
-      spinValue.setValue(0); // Reset animation
-      Animated.loop(
-        Animated.timing(spinValue, {
-          toValue: 1,
-          duration: 3000, // Tốc độ xoay
-          easing: Easing.linear,
-          useNativeDriver: true,
-        })
-      ).start();
-    } else {
-      spinValue.stopAnimation();
+    lyricOpacity.setValue(0);
+    Animated.timing(lyricOpacity, { 
+      toValue: 1, 
+      duration: 300, 
+      useNativeDriver: Platform.OS !== 'web' 
+    }).start();
+  }, [currentLyricIndex]);
+
+  const safeStartRecognition = () => {
+    if (!recognition) return;
+    try {
+      clearSearch();
+      recognition.stop(); 
+      setTimeout(() => {
+        recognition.lang = language;
+        recognition.start();
+        setIsRecording(true);
+      }, 150); 
+    } catch (e) {
+      setIsRecording(true);
     }
-  }, [isPlayingPreview]);
-
-  const spin = spinValue.interpolate({
-    inputRange: [0, 1],
-    outputRange: ['0deg', '360deg'],
-  });
-
-  const startRecording = () => {
-    if (!recognition) return Alert.alert("Lỗi", "Trình duyệt không hỗ trợ thu âm.");
-    setTranscript('');
-    setSearchResult(null);
-    setIsRecording(true);
-    setIsLoading(false); // Đảm bảo không hiện loading khi bắt đầu ghi âm
-    if (audioRef.current) { audioRef.current.pause(); setIsPlayingPreview(false); } // Dừng nhạc nếu đang phát
-    recognition.lang = language; // FR-10
-    recognition.start();
   };
 
-  const stopRecording = () => { recognition?.stop(); setIsRecording(false); };
+  // --- LOGIC QUÉT NHẠC ---
+  const startMusicScan = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorderRef.current = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      mediaRecorderRef.current.ondataavailable = (event: any) => audioChunksRef.current.push(event.data);
+      mediaRecorderRef.current.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+        identifyMusic(audioBlob);
+      };
+      clearSearch();
+      setIsScanningMusic(true);
+      setTranscript("Đang lắng nghe giai điệu... 🎶");
+      mediaRecorderRef.current.start();
+      
+      // Thu âm 8 giây để tối ưu Audio Fingerprinting
+      setTimeout(() => {
+        if (mediaRecorderRef.current?.state === "recording") {
+          mediaRecorderRef.current.stop();
+          setIsScanningMusic(false);
+        }
+      }, 8000);
+    } catch (err) { Alert.alert("Lỗi", "Không thể truy cập Microphone."); }
+  };
+
+  const identifyMusic = async (blob: Blob) => {
+    setIsLoading(true);
+    const formData = new FormData();
+    formData.append('file', blob);
+    formData.append('api_token', AUDD_API_TOKEN);
+    formData.append('return', 'apple_music');
+    try {
+      const response = await fetch('https://api.audd.io/', { method: 'POST', body: formData });
+      const data = await response.json();
+      if (data.status === 'success' && data.result) {
+        const res = {
+          title: data.result.title,
+          artist: data.result.artist,
+          artwork: data.result.apple_music?.artwork?.url.replace('{w}x{h}', '600x600') || 'https://via.assets.so/album.png?id=1&q=95&w=600&h=600',
+          previewUrl: data.result.apple_music?.previews?.[0]?.url || "",
+          youtubeUrl: `https://www.youtube.com/results?search_query=${encodeURIComponent(data.result.title + " " + data.result.artist)}`
+        };
+        setSearchResult(res);
+        fetchRealLyrics(res.artist, res.title);
+        saveToHistory("Quét giai điệu", res.title);
+      } else {
+        Alert.alert("Kết quả", "Không tìm thấy bài hát phù hợp.");
+        setTranscript("");
+      }
+    } catch (e) { Alert.alert("Lỗi", "Kết nối máy chủ thất bại."); } finally { setIsLoading(false); }
+  };
 
   const processAndSearch = async (text: string) => {
-    const cleanText = text.trim(); 
-    if (!cleanText) {
-      setIsLoading(false);
-      return;
-    }
-
+    let cleanText = text.toLowerCase().replace(/tìm bài hát|tìm bài|hát bài|mở bài|[.,?]/g, "").trim();
+    if (!cleanText) return setIsLoading(false);
+    
     try {
-      const response = await fetch(
-        `https://itunes.apple.com/search?term=${encodeURIComponent(cleanText)}&entity=song&limit=10&lang=vi_vn&explicit=yes`
-      );
+      const countryCode = language === 'vi-VN' ? 'VN' : 'US';
+      const response = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(cleanText)}&entity=song&limit=1&country=${countryCode}`);
       const data = await response.json();
-
-      if (data.results && data.results.length > 0) {
-        const song = data.results[0]; // Lấy kết quả đầu tiên (thường là phù hợp nhất)
-        
-        const result = {
-          title: song.trackName,
-          artist: song.artistName,
-          album: song.collectionName,
+      if (data.results?.length > 0) {
+        const song = data.results[0];
+        const res = { 
+          title: song.trackName, artist: song.artistName, 
+          artwork: song.artworkUrl100.replace('100x100bb', '600x600bb'), 
           previewUrl: song.previewUrl,
-          artwork: song.artworkUrl100 ? song.artworkUrl100.replace('100x100bb', '600x600bb') : 'https://via.placeholder.com/600x600?text=No+Image', // Ảnh dự phòng
+          youtubeUrl: `https://www.youtube.com/results?search_query=${encodeURIComponent(song.trackName + " " + song.artistName)}`
         };
-        setSearchResult(result);
-        saveToHistory(cleanText, result.title);
-      } else {
-        setSearchResult(null); 
-        console.log("Không tìm thấy bài hát cho:", cleanText);
+        setSearchResult(res);
+        fetchRealLyrics(res.artist, res.title);
+        saveToHistory(cleanText, res.title);
+      } else { 
+        Alert.alert("Kết quả", "Không tìm thấy bài hát phù hợp."); 
       }
-    } catch (error) {
-      setSearchResult(null);
-      Alert.alert("Lỗi", "Kết nối máy chủ tìm kiếm thất bại.");
-    } finally {
-      setIsLoading(false); // Dừng loading dù có kết quả hay không
-    }
+    } catch (e) { Alert.alert("Lỗi", "Tìm kiếm thất bại."); } finally { setIsLoading(false); }
   };
 
+  const fetchRealLyrics = async (artist: string, title: string) => {
+    try {
+      const response = await fetch(`https://lrclib.net/api/get?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}`);
+      const data = await response.json();
+      if (data?.syncedLyrics) {
+        const lines = data.syncedLyrics.split('\n').map((line: string) => {
+          const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+          return match ? { time: parseInt(match[1]) * 60 + parseFloat(match[2]), text: match[3].trim() } : null;
+        }).filter((l: any) => l !== null && l.text !== "");
+        setLyrics(lines);
+      } else { setLyrics([{ time: 0, text: "Lời bài hát hiện chưa đồng bộ." }]); }
+    } catch (e) { setLyrics([{ time: 0, text: "Không thể tải lời." }]); }
+  };
+
+  // FIX LỖI AbortError TỪ CONSOLE
   const playPreview = () => {
-    if (searchResult?.previewUrl && audioRef.current) {
-      if (isPlayingPreview) { // Nếu đang phát thì dừng
-        audioRef.current.pause();
-        setIsPlayingPreview(false);
-      } else { // Nếu chưa phát thì bắt đầu phát
-        audioRef.current.src = searchResult.previewUrl;
-        audioRef.current.play().then(() => {
-          setIsPlayingPreview(true);
-        }).catch(() => Alert.alert("Lỗi", "Không thể phát nhạc mẫu."));
+    if (audioRef.current && searchResult?.previewUrl) {
+      if (isPlayingPreview) { 
+        audioRef.current.pause(); 
+        setIsPlayingPreview(false); 
+      } else { 
+        audioRef.current.src = searchResult.previewUrl; 
+        const playPromise = audioRef.current.play();
+        if (playPromise !== undefined) {
+          playPromise.then(() => setIsPlayingPreview(true)).catch(e => console.log("Playback interrupted"));
+        }
       }
-    } else if (audioRef.current && !searchResult?.previewUrl) {
-      Alert.alert("Thông báo", "Không có nhạc mẫu cho bài này.");
     }
-  };
-
-  // Dừng nhạc khi preview kết thúc
-  const handleAudioEnd = () => {
-    setIsPlayingPreview(false);
   };
 
   const clearSearch = () => {
-    setTranscript('');
-    setSearchResult(null);
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current.src = ""; }
-    setIsPlayingPreview(false);
+    setSearchResult(null); setLyrics([]); setIsPlayingPreview(false); setTranscript(''); setCurrentLyricIndex(-1);
+    if (audioRef.current) audioRef.current.pause();
   };
 
-  const saveToHistory = async (text: string, song: string) => {
-    const updated = [{ id: Date.now(), text, result: song }, ...history].slice(0, 5);
+  const saveToHistory = async (t: string, s: string) => {
+    const updated = [{ id: Date.now(), text: t, result: s }, ...history].slice(0, 5);
     setHistory(updated);
     await AsyncStorage.setItem('@music_history', JSON.stringify(updated));
   };
@@ -171,14 +224,37 @@ export default function HomeScreen() {
     if (saved) setHistory(JSON.parse(saved));
   };
 
+  useEffect(() => {
+    if (isPlayingPreview) {
+      spinValue.setValue(0);
+      Animated.loop(Animated.timing(spinValue, { 
+        toValue: 1, 
+        duration: 5000, 
+        easing: Easing.linear, 
+        useNativeDriver: Platform.OS !== 'web' 
+      })).start();
+    } else { spinValue.stopAnimation(); }
+  }, [isPlayingPreview]);
+
+  const spin = spinValue.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
+
   return (
     <View style={styles.container}>
-      {/* FR-11: Trình phát nhạc ẩn */}
-      {Platform.OS === 'web' && <audio ref={audioRef} style={{ display: 'none' }} onEnded={handleAudioEnd} />}
+      {Platform.OS === 'web' && (
+        <audio 
+          ref={audioRef} 
+          onTimeUpdate={() => {
+            if (audioRef.current && lyrics.length > 0) {
+              const idx = lyrics.findLastIndex(l => audioRef.current!.currentTime >= l.time);
+              if (idx !== currentLyricIndex) setCurrentLyricIndex(idx);
+            }
+          }} 
+          onEnded={() => { setIsPlayingPreview(false); setCurrentLyricIndex(-1); }} 
+        />
+      )}
       
       <Text style={styles.header}>{APP_NAME}</Text>
 
-      {/* FR-10: Chọn ngôn ngữ giao diện Tab chuyên nghiệp */}
       <View style={styles.tabContainer}>
         <TouchableOpacity style={[styles.tab, language === 'vi-VN' && styles.activeTab]} onPress={() => setLanguage('vi-VN')}>
           <Text style={[styles.tabText, language === 'vi-VN' && styles.activeTabText]}>TIẾNG VIỆT</Text>
@@ -189,188 +265,89 @@ export default function HomeScreen() {
       </View>
 
       <ScrollView contentContainerStyle={styles.scrollBody} showsVerticalScrollIndicator={false}>
-        {transcript !== '' && <Text style={styles.transcript}>" {transcript} "</Text>}
+        {transcript !== '' && <Text style={styles.transcript}>"{transcript}"</Text>}
+        {isLoading && <ActivityIndicator size="large" color="#1DB954" style={{ marginTop: 50 }} />}
 
-        {isLoading && (
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" color="#1DB954" />
-            <Text style={styles.loadingText}>Đang tìm nhạc...</Text>
-          </View>
-        )}
-
-        {/* FR-06: Hiển thị Card kết quả với Poster ảnh bìa */}
         {!isLoading && searchResult && (
           <View style={styles.resultCard}>
-            {searchResult.artwork && (
-              <Animated.Image 
-                source={{ uri: searchResult.artwork }} 
-                style={[
-                  styles.albumArt, 
-                  isPlayingPreview && { transform: [{ rotate: spin }] } // Áp dụng hiệu ứng xoay
-                ]} 
-              />
-            )}
-            <View style={styles.infoBox}>
-              <Text style={styles.songTitle} numberOfLines={1}>🎵 {searchResult.title}</Text>
-              <Text style={styles.artistName}>👤 {searchResult.artist}</Text>
-              <Text style={styles.albumName}>💿 {searchResult.album}</Text>
+            <Animated.Image source={{ uri: searchResult.artwork }} style={[styles.albumArt, isPlayingPreview && { transform: [{ rotate: spin }] }]} />
+            <View style={styles.lyricsContainer}>
+              <Animated.View style={{ opacity: lyricOpacity }}>
+                <Text style={styles.karaokeText}>
+                  {currentLyricIndex >= 0 ? lyrics[currentLyricIndex].text : (isPlayingPreview ? "🎶 ... 🎶" : "Sẵn sàng!")}
+                </Text>
+              </Animated.View>
             </View>
+            <Text style={styles.songTitle}>{searchResult.title}</Text>
+            <Text style={styles.artistName}>{searchResult.artist}</Text>
             <TouchableOpacity onPress={playPreview} style={styles.playButton}>
-              <Text style={styles.playButtonText}>{isPlayingPreview ? "DỪNG NHẠC MẪU" : "NGHE NHẠC MẪU"}</Text>
+              <Text style={styles.playButtonText}>{isPlayingPreview ? "⏹ DỪNG PHÁT" : "🎤 NGHE THỬ"}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => Linking.openURL(searchResult.youtubeUrl)} style={styles.youtubeButton}>
+              <Text style={styles.youtubeButtonText}>📺 XEM TRÊN YOUTUBE</Text>
             </TouchableOpacity>
           </View>
         )}
         
-        {/* FR-09: Lịch sử tìm kiếm */}
         {history.length > 0 && (
           <View style={styles.historySection}>
-            <Text style={styles.historyTitle}>Lịch sử gần đây</Text>
+            <Text style={styles.historyTitle}>Lịch sử tìm kiếm</Text>
             {history.map(item => (
               <View key={item.id} style={styles.historyRow}>
-                <Text style={styles.historyText}>• {item.result}</Text>
+                <Text style={styles.historyText}>• {item.result} ({item.text})</Text>
               </View>
             ))}
           </View>
         )}
       </ScrollView>
 
-      {/* Footer chứa nút Record (FR-01/02) */}
       <View style={styles.footer}>
-        <TouchableOpacity 
-          style={[styles.recordOuter, isRecording && styles.recordOuterActive]} 
-          onPress={isRecording ? stopRecording : startRecording}
-          disabled={isLoading} // Không cho bấm khi đang loading
-        >
-          <View style={[styles.recordInner, isRecording && {backgroundColor: '#ff4444'}]}>
-            <Text style={styles.recordLabel}>{isRecording ? "STOP" : "REC"}</Text>
-          </View>
-        </TouchableOpacity>
-        
-        <TouchableOpacity onPress={clearSearch} style={styles.clearContainer}>
-          <Text style={styles.clearText}>Xóa kết quả</Text>
-        </TouchableOpacity>
+        <View style={{ flexDirection: 'row', gap: 30 }}>
+          <TouchableOpacity 
+            style={[styles.recordBtn, isRecording && { borderColor: '#ff4444' }]} 
+            onPress={isRecording ? () => recognition?.stop() : safeStartRecognition}
+          >
+            <Text style={styles.btnIcon}>{isRecording ? "🛑" : "🎤"}</Text>
+            <Text style={styles.btnSub}>{isRecording ? "STOP" : "RECORD"}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity style={[styles.recordBtn, { borderColor: '#0084ff' }]} onPress={startMusicScan}>
+            {isScanningMusic ? <ActivityIndicator color="#0084ff" /> : <Text style={styles.btnIcon}>🎵</Text>}
+            <Text style={[styles.btnSub, { color: '#0084ff' }]}>QUÉT NHẠC</Text>
+          </TouchableOpacity>
+        </View>
+        <TouchableOpacity onPress={clearSearch} style={{ marginTop: 15 }}><Text style={{ color: '#444', fontSize: 12 }}>Xóa kết quả</Text></TouchableOpacity>
       </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0F0F0F', paddingHorizontal: 20 },
-  header: { 
-    fontSize: 32, // To hơn
-    fontWeight: '900', 
-    color: '#1DB954', 
-    textAlign: 'center', 
-    marginTop: 50, 
-    letterSpacing: 4, 
-    textShadowColor: 'rgba(29, 185, 84, 0.5)', // Hiệu ứng phát sáng
-    textShadowOffset: { width: 0, height: 0 },
-    textShadowRadius: 10 
-  },
-  
-  tabContainer: { flexDirection: 'row', backgroundColor: '#1E1E1E', borderRadius: 30, padding: 5, marginTop: 25, alignSelf: 'center', width: '85%' },
+  container: { flex: 1, backgroundColor: '#0F0F0F' },
+  header: { fontSize: 32, fontWeight: '900', color: '#1DB954', textAlign: 'center', marginTop: 40 },
+  tabContainer: { flexDirection: 'row', backgroundColor: '#1E1E1E', borderRadius: 30, padding: 5, marginTop: 20, alignSelf: 'center', width: '85%' },
   tab: { flex: 1, paddingVertical: 12, alignItems: 'center', borderRadius: 25 },
   activeTab: { backgroundColor: '#1DB954' },
-  tabText: { color: '#777', fontWeight: '800', fontSize: 12 },
+  tabText: { color: '#777', fontWeight: '800', fontSize: 11 },
   activeTabText: { color: '#FFF' },
-
-  scrollBody: { alignItems: 'center', paddingBottom: 150 },
-  transcript: { color: '#1DB954', fontStyle: 'italic', marginVertical: 20, fontSize: 16, textAlign: 'center', opacity: 0.8 },
-  
-  // Hiệu ứng Loading
-  loadingContainer: {
-    marginTop: 50,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  loadingText: {
-    color: '#FFF',
-    marginTop: 10,
-    fontSize: 16,
-  },
-
-  // FR-06: Result Card (VIP Style)
-  resultCard: { 
-    width: '100%', 
-    backgroundColor: '#1A1A1A', 
-    borderRadius: 25, 
-    padding: 20, 
-    borderWidth: 1, 
-    borderColor: '#333', 
-    shadowColor: '#1DB954', 
-    shadowOpacity: 0.3, 
-    shadowRadius: 20, 
-    elevation: 15,
-    marginTop: 30, // Đẩy xuống một chút
-  },
-  albumArt: { 
-    width: '100%', 
-    height: 280, 
-    borderRadius: 20, 
-    marginBottom: 20,
-    // Đảm bảo ảnh không bị bể
-    resizeMode: 'cover', 
-    overflow: 'hidden',
-  },
-  infoBox: { marginBottom: 20, paddingHorizontal: 5 },
-  songTitle: { color: '#FFF', fontSize: 22, fontWeight: 'bold' },
-  artistName: { color: '#1DB954', fontSize: 17, marginTop: 6, fontWeight: '600' },
-  albumName: { color: '#666', fontSize: 14, marginTop: 4 },
-  playButton: { 
-    backgroundColor: '#1DB954', 
-    paddingVertical: 15, 
-    borderRadius: 35, 
-    alignItems: 'center', 
-    shadowColor: '#1DB954', 
-    shadowOpacity: 0.4, 
-    shadowRadius: 10 
-  },
-  playButtonText: { color: '#FFF', fontWeight: '900', letterSpacing: 1 },
-
-  // FR-09: History Section
-  historySection: { 
-    width: '100%', 
-    marginTop: 35, 
-    padding: 20, 
-    backgroundColor: '#151515', 
-    borderRadius: 20, 
-    borderLeftWidth: 4, 
-    borderLeftColor: '#1DB954' 
-  },
-  historyTitle: { color: '#FFF', fontWeight: '800', fontSize: 15, marginBottom: 12, opacity: 0.9 },
-  historyRow: { paddingVertical: 6 },
-  historyText: { color: '#777', fontSize: 14 },
-
-  // FR-01/02: Floating Footer & Record Button
-  footer: { 
-    position: 'absolute', 
-    bottom: 40, 
-    left: 0, 
-    right: 0, 
-    alignItems: 'center',
-    zIndex: 10, // Đảm bảo footer luôn ở trên cùng
-  },
-  recordOuter: { 
-    width: 90, 
-    height: 90, 
-    borderRadius: 45, 
-    backgroundColor: 'rgba(29, 185, 84, 0.15)', 
-    justifyContent: 'center', 
-    alignItems: 'center', 
-    borderWidth: 2, 
-    borderColor: '#1DB954' 
-  },
-  recordOuterActive: { borderColor: '#ff4444', backgroundColor: 'rgba(255, 68, 68, 0.15)' },
-  recordInner: { 
-    width: 66, 
-    height: 66, 
-    borderRadius: 33, 
-    backgroundColor: '#1DB954', 
-    justifyContent: 'center', 
-    alignItems: 'center', 
-    elevation: 10 
-  },
-  recordLabel: { color: '#FFF', fontWeight: '900', fontSize: 15 },
-  clearContainer: { marginTop: 15, padding: 10 },
-  clearText: { color: '#444', textDecorationLine: 'underline', fontSize: 12, fontWeight: '600' },
+  scrollBody: { alignItems: 'center', padding: 20, paddingBottom: 200 },
+  transcript: { color: '#1DB954', fontStyle: 'italic', marginVertical: 15, fontSize: 16, textAlign: 'center' },
+  resultCard: { width: '100%', backgroundColor: '#1A1A1A', borderRadius: 25, padding: 25, alignItems: 'center', borderWidth: 1, borderColor: '#333' },
+  albumArt: { width: 180, height: 180, borderRadius: 90, borderWidth: 4, borderColor: '#1DB954' },
+  lyricsContainer: { width: '100%', minHeight: 80, justifyContent: 'center', alignItems: 'center', marginVertical: 15, padding: 10, backgroundColor: 'rgba(29, 185, 84, 0.05)', borderRadius: 15 },
+  karaokeText: { color: '#1DB954', fontSize: 19, fontWeight: '900', textAlign: 'center', textTransform: 'uppercase' },
+  songTitle: { color: '#FFF', fontSize: 18, fontWeight: 'bold', textAlign: 'center' },
+  artistName: { color: '#1DB954', fontSize: 14, marginTop: 5 },
+  playButton: { backgroundColor: '#1DB954', width: '100%', padding: 14, borderRadius: 30, marginTop: 15, alignItems: 'center' },
+  playButtonText: { color: '#FFF', fontWeight: '900' },
+  youtubeButton: { marginTop: 10, width: '100%', padding: 14, borderRadius: 30, alignItems: 'center', borderWidth: 1, borderColor: '#FF0000' },
+  youtubeButtonText: { color: '#FF0000', fontWeight: 'bold' },
+  historySection: { width: '100%', marginTop: 20, padding: 15, backgroundColor: '#151515', borderRadius: 15 },
+  historyTitle: { color: '#FFF', fontWeight: 'bold', marginBottom: 5 },
+  historyRow: { paddingVertical: 3 },
+  historyText: { color: '#777', fontSize: 13 },
+  footer: { position: 'absolute', bottom: 30, width: '100%', alignItems: 'center' },
+  recordBtn: { width: 85, height: 85, borderRadius: 45, borderWidth: 2, borderColor: '#1DB954', justifyContent: 'center', alignItems: 'center', backgroundColor: '#1A1A1A' },
+  btnIcon: { fontSize: 28 },
+  btnSub: { fontSize: 10, color: '#1DB954', fontWeight: '900', marginTop: 4 }
 });
